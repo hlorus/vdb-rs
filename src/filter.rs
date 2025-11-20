@@ -335,3 +335,251 @@ impl<ValueTy: Clone> Clone for Grid<ValueTy> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Compression, GridDescriptor, Map, Metadata, Node4, Node5, Tree};
+    use bitvec::prelude::*;
+    use std::collections::HashMap;
+
+    /// Create a simple test grid with known values
+    fn create_test_grid() -> Grid<f32> {
+        // Create a simple 8x8x8 grid with values
+        let mut buffer = vec![0.0f32; 512]; // 8^3
+        let mut value_mask = bitvec![u64, Lsb0; 0; 512];
+
+        // Fill with a pattern: values increase with distance from origin
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let idx = (z * 64 + y * 8 + x) as usize;
+                    let distance = ((x * x + y * y + z * z) as f32).sqrt();
+                    buffer[idx] = distance;
+                    value_mask.set(idx, true);
+                }
+            }
+        }
+
+        let node3 = Node3 {
+            buffer,
+            value_mask,
+            origin: IVec3::ZERO,
+        };
+
+        let mut node4_map = HashMap::new();
+        node4_map.insert(0, node3);
+
+        let node4 = Node4 {
+            child_mask: bitvec![u64, Lsb0; 1; 4096],
+            value_mask: bitvec![u64, Lsb0; 0; 4096],
+            nodes: node4_map,
+            data: vec![],
+            origin: IVec3::ZERO,
+        };
+
+        let mut node5_map = HashMap::new();
+        node5_map.insert(0, node4);
+
+        let node5 = Node5 {
+            child_mask: bitvec![u64, Lsb0; 1; 32768],
+            value_mask: bitvec![u64, Lsb0; 0; 32768],
+            nodes: node5_map,
+            data: vec![],
+            origin: IVec3::ZERO,
+        };
+
+        Grid {
+            tree: Tree {
+                root_nodes: vec![node5],
+            },
+            transform: Map::UniformScaleMap {
+                scale_values: glam::DVec3::ONE,
+                voxel_size: glam::DVec3::ONE,
+                scale_values_inverse: glam::DVec3::ONE,
+                inv_scale_sqr: glam::DVec3::ONE,
+                inv_twice_scale: glam::DVec3::splat(0.5),
+            },
+            descriptor: GridDescriptor {
+                name: "test".to_string(),
+                file_version: 0,
+                instance_parent: String::new(),
+                grid_type: "float".to_string(),
+                grid_pos: 0,
+                block_pos: 0,
+                end_pos: 0,
+                compression: Compression::NONE,
+                meta_data: Metadata::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_offset() {
+        let grid = create_test_grid();
+        let filter = Filter::new(&grid);
+        let offset_value = 2.5f32;
+
+        // Apply offset
+        let result = filter.offset(offset_value);
+
+        // Verify all values are offset correctly
+        let original_node = &grid.tree.root_nodes[0].nodes[&0].nodes[&0];
+        let result_node = &result.tree.root_nodes[0].nodes[&0].nodes[&0];
+
+        for (idx, active) in original_node.value_mask.iter().enumerate() {
+            if *active && idx < original_node.buffer.len() {
+                let original_val = original_node.buffer[idx];
+                let result_val = result_node.buffer[idx];
+                let expected = original_val + offset_value;
+                assert!(
+                    (result_val - expected).abs() < 0.0001,
+                    "Offset failed at index {}: expected {}, got {}",
+                    idx,
+                    expected,
+                    result_val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mean_filter_center_voxel() {
+        let grid = create_test_grid();
+        let filter = Filter::new(&grid);
+
+        // Apply mean filter with width 1
+        let config = FilterConfig {
+            width: 1,
+            iterations: 1,
+        };
+        let result = filter.mean(config);
+
+        // Check the center voxel (4,4,4) - it should be averaged with its 26 neighbors
+        // We can't easily compute the exact expected value without sampling,
+        // but we can verify it changed and is within reasonable bounds
+        let original_node = &grid.tree.root_nodes[0].nodes[&0].nodes[&0];
+        let result_node = &result.tree.root_nodes[0].nodes[&0].nodes[&0];
+
+        let center_idx = (4 * 64 + 4 * 8 + 4) as usize;
+        let original_val = original_node.buffer[center_idx];
+        let result_val = result_node.buffer[center_idx];
+
+        // The filtered value should be different but in a reasonable range
+        assert_ne!(original_val, result_val, "Mean filter should change values");
+        assert!(
+            result_val > 0.0 && result_val < 15.0,
+            "Filtered value out of expected range: {}",
+            result_val
+        );
+    }
+
+    #[test]
+    fn test_gaussian_approximation() {
+        let grid = create_test_grid();
+        let filter = Filter::new(&grid);
+
+        let config = FilterConfig {
+            width: 1,
+            iterations: 1,
+        };
+
+        // Gaussian should apply mean 4 times
+        let gaussian_result = filter.gaussian(config);
+
+        // Apply mean 4 times manually
+        let mean_config = FilterConfig {
+            width: 1,
+            iterations: 4,
+        };
+        let mean_result = filter.mean(mean_config);
+
+        // Results should be identical
+        let gaussian_node = &gaussian_result.tree.root_nodes[0].nodes[&0].nodes[&0];
+        let mean_node = &mean_result.tree.root_nodes[0].nodes[&0].nodes[&0];
+
+        for idx in 0..gaussian_node.buffer.len() {
+            let diff = (gaussian_node.buffer[idx] - mean_node.buffer[idx]).abs();
+            assert!(
+                diff < 0.0001,
+                "Gaussian should equal 4x mean iterations at index {}: diff = {}",
+                idx,
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_median_filter() {
+        let grid = create_test_grid();
+        let filter = Filter::new(&grid);
+
+        let config = FilterConfig {
+            width: 1,
+            iterations: 1,
+        };
+        let result = filter.median(config);
+
+        // Verify the result is different from original
+        let original_node = &grid.tree.root_nodes[0].nodes[&0].nodes[&0];
+        let result_node = &result.tree.root_nodes[0].nodes[&0].nodes[&0];
+
+        let mut changed_count = 0;
+        for idx in 0..original_node.buffer.len() {
+            if (original_node.buffer[idx] - result_node.buffer[idx]).abs() > 0.0001 {
+                changed_count += 1;
+            }
+        }
+
+        // At least some values should change
+        assert!(
+            changed_count > 0,
+            "Median filter should change at least some values"
+        );
+    }
+
+    #[test]
+    fn test_multiple_iterations() {
+        let grid = create_test_grid();
+        let filter = Filter::new(&grid);
+
+        // Single iteration
+        let config1 = FilterConfig {
+            width: 1,
+            iterations: 1,
+        };
+        let result1 = filter.mean(config1);
+
+        // Two iterations
+        let config2 = FilterConfig {
+            width: 1,
+            iterations: 2,
+        };
+        let result2 = filter.mean(config2);
+
+        // Results should be different
+        let node1 = &result1.tree.root_nodes[0].nodes[&0].nodes[&0];
+        let node2 = &result2.tree.root_nodes[0].nodes[&0].nodes[&0];
+
+        let center_idx = (4 * 64 + 4 * 8 + 4) as usize;
+        assert_ne!(
+            node1.buffer[center_idx], node2.buffer[center_idx],
+            "Multiple iterations should produce different results"
+        );
+    }
+
+    #[test]
+    fn test_filterable_f32() {
+        let val = 3.5f32;
+        assert_eq!(val.to_f32(), 3.5);
+        assert_eq!(f32::from_f32(3.5), 3.5);
+    }
+
+    #[test]
+    fn test_filterable_f16() {
+        let val = half::f16::from_f32(3.5);
+        assert!((val.to_f32() - 3.5).abs() < 0.001);
+        let result = half::f16::from_f32(3.5);
+        assert!((result.to_f32() - 3.5).abs() < 0.001);
+    }
+}
