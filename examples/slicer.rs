@@ -1,62 +1,16 @@
-// NOTE: This example requires bevy-aabb-instancing, which doesn't yet support Bevy 0.17
-// The example has been updated for Bevy 0.17 API changes but won't compile until
-// bevy-aabb-instancing is updated. Track progress at:
-// https://github.com/ForesightMiningSoftwareCorporation/bevy_aabb_instancing
+// NOTE: Using bevy-aabb-instancing from upstream PR for Bevy 0.17 support
 
 use bevy::prelude::*;
-// use bevy_aabb_instancing::{
-//     Cuboid, CuboidMaterial, CuboidMaterialId, CuboidMaterialMap, Cuboids, ScalarHueOptions,
-//     VertexPullingRenderPlugin, COLOR_MODE_SCALAR_HUE,
-// };
+use bevy_aabb_instancing::{
+    Cuboid, CuboidMaterial, CuboidMaterialId, CuboidMaterialMap, Cuboids, ScalarHueOptions,
+    VertexPullingRenderPlugin, COLOR_MODE_SCALAR_HUE,
+};
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 use half::f16;
 use vdb_rs::{Grid, Map, VdbLevel, VdbReader};
 
 use std::{error::Error, fs::File, io::BufReader};
-
-// Placeholder types until bevy-aabb-instancing is updated
-struct Cuboid;
-impl Cuboid {
-    fn new(_: bevy::math::Vec3, _: bevy::math::Vec3, _: u32) -> Self { Self }
-}
-struct CuboidMaterial;
-#[allow(non_upper_case_globals)]
-const COLOR_MODE_SCALAR_HUE: i32 = 0;
-struct ScalarHueOptions {
-    min_visible: f32,
-    max_visible: f32,
-    clamp_min: f32,
-    clamp_max: f32,
-}
-impl Default for ScalarHueOptions {
-    fn default() -> Self {
-        Self {
-            min_visible: 0.0,
-            max_visible: 1.0,
-            clamp_min: 0.0,
-            clamp_max: 1.0,
-        }
-    }
-}
-type CuboidMaterialMap = Vec<CuboidMaterial>;
-struct Cuboids;
-impl Cuboids {
-    fn new(_: Vec<Cuboid>) -> Self { Self }
-    fn aabb(&self) -> bevy::math::bounding::Aabb3d {
-        bevy::math::bounding::Aabb3d {
-            min: Vec3::ZERO.into(),
-            max: Vec3::ONE.into(),
-        }
-    }
-}
-struct VertexPullingRenderPlugin {
-    outlines: bool,
-}
-impl bevy::app::Plugin for VertexPullingRenderPlugin {
-    fn build(&self, _app: &mut bevy::app::App) {}
-}
-type CuboidMaterialId = usize;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum SliceAxis {
@@ -169,15 +123,11 @@ fn settings_ui(mut contexts: EguiContexts, mut settings: ResMut<RenderSettings>)
     });
 }
 
-// Marker component for voxel entities
-#[derive(Component)]
-struct VoxelMarker;
-
 fn rebuild_model(
     mut commands: Commands,
     mut settings: ResMut<RenderSettings>,
     model_data: Res<ModelData>,
-    existing_voxels: Query<Entity, With<VoxelMarker>>,
+    existing_voxels: Query<Entity, With<Cuboids>>,
 ) {
     if settings.dirty {
         for entity in existing_voxels.iter() {
@@ -238,87 +188,45 @@ fn rebuild_model(
         settings.visible_voxels = instances.len() as u64;
         let cuboids = Cuboids::new(instances);
 
-        let _aabb = cuboids.aabb();
-        commands.spawn((
-            Transform::default(),
-            Visibility::default(),
-            VoxelMarker,
-            // cuboids, aabb, and material will be added when bevy-aabb-instancing is updated
-        ));
+        let aabb = cuboids.aabb();
+        commands
+            .spawn((Transform::default(), Visibility::default()))
+            .insert((cuboids, aabb, model_data.color_options_id));
         settings.dirty = false;
     }
 }
 
 /// set up a simple 3D scene
-fn setup(mut commands: Commands) {
-    // Note: Example disabled until bevy-aabb-instancing supports Bevy 0.17
-    // Uncomment when dependency is updated:
-
-    // let grid = load_grid();
-    //
-    // commands.insert_resource(RenderSettings {
-    //     render_mode: RenderMode::FirstDensity,
-    //     render_slice_index: 0,
-    //     min_slice_indices: grid.descriptor.aabb_min().unwrap(),
-    //     max_slice_indices: grid.descriptor.aabb_max().unwrap(),
-    //     dirty: true,
-    //     visible_voxels: 0,
-    // });
-    //
-    // commands.insert_resource(ModelData {
-    //     color_options_id: 0,
-    //     grid,
-    // });
-
-    // Note: This example requires a VDB file to be provided as an argument
-    // and bevy-aabb-instancing to be updated for Bevy 0.17
-    let grid = if std::env::args().nth(1).is_some() {
-        load_grid()
-    } else {
-        eprintln!("Warning: No VDB file provided. This example requires a .vdb file as the first argument.");
-        eprintln!("Usage: cargo run --example slicer -- path/to/file.vdb [grid_name]");
-        eprintln!("Note: This example also requires bevy-aabb-instancing to support Bevy 0.17");
-        // Create an empty grid to allow compilation
-        Grid {
-            descriptor: vdb_rs::GridDescriptor {
-                name: String::from("empty"),
-                file_version: 0,
-                instance_parent: String::new(),
-                grid_type: String::from("unknown"),
-                grid_pos: 0,
-                block_pos: 0,
-                end_pos: 0,
-                compression: vdb_rs::Compression::NONE,
-                meta_data: vdb_rs::Metadata::default(),
-            },
-            transform: Map::UniformScaleMap {
-                scale_values: glam::DVec3::ONE,
-                voxel_size: glam::DVec3::ONE,
-                scale_values_inverse: glam::DVec3::ONE,
-                inv_scale_sqr: glam::DVec3::ONE,
-                inv_twice_scale: glam::DVec3::ONE,
-            },
-            tree: vdb_rs::Tree { root_nodes: Vec::new() },
-        }
-    };
+fn setup(mut commands: Commands, mut color_options_map: ResMut<CuboidMaterialMap>) {
+    let grid = load_grid();
 
     // Convert glam 0.24 IVec3 to glam 0.30 IVec3 (for Bevy 0.17)
-    let min_indices_old = grid.descriptor.aabb_min().unwrap_or(glam::IVec3::ZERO);
-    let max_indices_old = grid.descriptor.aabb_max().unwrap_or(glam::IVec3::ONE);
-    let min_indices = IVec3::new(min_indices_old.x, min_indices_old.y, min_indices_old.z);
-    let max_indices = IVec3::new(max_indices_old.x, max_indices_old.y, max_indices_old.z);
+    let min_indices_old = grid.descriptor.aabb_min().unwrap();
+    let max_indices_old = grid.descriptor.aabb_max().unwrap();
+    let min_slice_indices = IVec3::new(min_indices_old.x, min_indices_old.y, min_indices_old.z);
+    let max_slice_indices = IVec3::new(max_indices_old.x, max_indices_old.y, max_indices_old.z);
 
     commands.insert_resource(RenderSettings {
         render_mode: RenderMode::FirstDensity,
         render_slice_index: 0,
-        min_slice_indices: min_indices,
-        max_slice_indices: max_indices,
-        dirty: false,
+        min_slice_indices,
+        max_slice_indices,
+        dirty: true,
         visible_voxels: 0,
     });
 
     commands.insert_resource(ModelData {
-        color_options_id: 0,
+        color_options_id: color_options_map.push(CuboidMaterial {
+            color_mode: COLOR_MODE_SCALAR_HUE,
+            scalar_hue: ScalarHueOptions {
+                min_visible: -10000.0,
+                max_visible: 10000.0,
+                clamp_min: -1.0,
+                clamp_max: 0.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
         grid,
     });
     commands.spawn((
