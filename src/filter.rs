@@ -9,7 +9,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use vdb_rs::{Filter, FilterConfig, VdbReader};
+//! use vdb_rs::{Filter, FilterConfig, MaskConfig, VdbReader};
 //! use std::{fs::File, io::BufReader};
 //!
 //! let f = File::open("example.vdb").unwrap();
@@ -21,12 +21,16 @@
 //! let smoothed = filter.mean(FilterConfig {
 //!     width: 2,
 //!     iterations: 1,
+//!     mask: None,
 //! });
 //!
-//! // Apply a Gaussian filter
-//! let gaussian = filter.gaussian(FilterConfig {
+//! // Apply a Gaussian filter with mask
+//! let mask_grid = reader.read_grid::<f32>("mask").unwrap();
+//! let filter_with_mask = Filter::with_mask(&grid, &mask_grid);
+//! let gaussian = filter_with_mask.gaussian(FilterConfig {
 //!     width: 1,
 //!     iterations: 1,
+//!     mask: Some(MaskConfig::new(0.0, 1.0)),
 //! });
 //! ```
 
@@ -64,6 +68,48 @@ pub struct FilterConfig {
     pub width: i32,
     /// Number of iterations to apply
     pub iterations: usize,
+    /// Optional mask grid for alpha blending
+    pub mask: Option<MaskConfig>,
+}
+
+/// Configuration for alpha mask blending
+pub struct MaskConfig {
+    /// Minimum mask value (maps to alpha 0)
+    pub min: f32,
+    /// Maximum mask value (maps to alpha 1)
+    pub max: f32,
+    /// Whether to invert the mask (min->max becomes 1->0)
+    pub invert: bool,
+}
+
+impl MaskConfig {
+    /// Create a new mask config with the given range
+    pub fn new(min: f32, max: f32) -> Self {
+        assert!(min < max, "Mask min must be less than max");
+        Self {
+            min,
+            max,
+            invert: false,
+        }
+    }
+
+    /// Invert the mask mapping
+    pub fn inverted(mut self) -> Self {
+        self.invert = true;
+        self
+    }
+
+    /// Compute alpha blending factors from a mask value
+    /// Returns (alpha, complement) where final = complement*original + alpha*filtered
+    fn compute_alpha(&self, mask_value: f32) -> (f32, f32) {
+        let normalized = ((mask_value - self.min) / (self.max - self.min)).clamp(0.0, 1.0);
+        let alpha = if self.invert {
+            1.0 - normalized
+        } else {
+            normalized
+        };
+        (alpha, 1.0 - alpha)
+    }
 }
 
 impl Default for FilterConfig {
@@ -71,6 +117,7 @@ impl Default for FilterConfig {
         Self {
             width: 1,
             iterations: 1,
+            mask: None,
         }
     }
 }
@@ -78,26 +125,39 @@ impl Default for FilterConfig {
 /// Filter operations on VDB grids
 pub struct Filter<'a, ValueTy> {
     grid: &'a Grid<ValueTy>,
+    mask_grid: Option<&'a Grid<f32>>,
 }
 
 impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
     /// Create a new filter for the given grid
     pub fn new(grid: &'a Grid<ValueTy>) -> Self {
-        Self { grid }
+        Self {
+            grid,
+            mask_grid: None,
+        }
+    }
+
+    /// Create a new filter with an optional mask grid
+    pub fn with_mask(grid: &'a Grid<ValueTy>, mask: &'a Grid<f32>) -> Self {
+        Self {
+            grid,
+            mask_grid: Some(mask),
+        }
     }
 
     /// Apply a mean (box) filter to the grid
     ///
     /// The mean filter performs separable filtering along each axis.
     /// Filter width is 2*width+1 voxels.
+    /// If a mask is configured, it blends original and filtered values.
     pub fn mean(&self, config: FilterConfig) -> Grid<ValueTy> {
         let mut result = self.grid.clone();
 
         for _ in 0..config.iterations {
             // Apply separable mean filter: X, then Z, then Y (OpenVDB order)
-            result = self.mean_pass_x(&result, config.width);
-            result = self.mean_pass_z(&result, config.width);
-            result = self.mean_pass_y(&result, config.width);
+            result = self.mean_pass_x(&result, config.width, &config.mask);
+            result = self.mean_pass_z(&result, config.width, &config.mask);
+            result = self.mean_pass_y(&result, config.width, &config.mask);
         }
 
         result
@@ -111,6 +171,7 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
         let gaussian_config = FilterConfig {
             width: config.width,
             iterations: config.iterations * 4, // 4 mean iterations per Gaussian iteration
+            mask: config.mask,
         };
         self.mean(gaussian_config)
     }
@@ -119,18 +180,20 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
     ///
     /// Non-separable filter that replaces each voxel with the median
     /// of its neighborhood.
+    /// If a mask is configured, it blends original and filtered values.
     pub fn median(&self, config: FilterConfig) -> Grid<ValueTy> {
         let mut result = self.grid.clone();
 
         for _ in 0..config.iterations {
-            result = self.median_pass(&result, config.width);
+            result = self.median_pass(&result, config.width, &config.mask);
         }
 
         result
     }
 
     /// Add a constant offset to all active voxels
-    pub fn offset(&self, offset: ValueTy) -> Grid<ValueTy> {
+    /// If a mask is configured, it blends original and offset values.
+    pub fn offset(&self, offset: ValueTy, mask_config: Option<MaskConfig>) -> Grid<ValueTy> {
         let mut result = self.grid.clone();
 
         // Apply offset to all active voxels in leaf nodes
@@ -139,7 +202,36 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
                 for node3 in node4.nodes.values_mut() {
                     for (idx, active) in node3.value_mask.iter().enumerate() {
                         if *active && idx < node3.buffer.len() {
-                            node3.buffer[idx] = node3.buffer[idx] + offset;
+                            let original_value = node3.buffer[idx];
+                            let offset_value = original_value + offset;
+
+                            // Apply mask blending if configured
+                            let final_value = if let Some(ref config) = mask_config {
+                                if let Some(mask_grid) = self.mask_grid {
+                                    let local_coord = IVec3::new(
+                                        (idx % 8) as i32,
+                                        ((idx / 8) % 8) as i32,
+                                        (idx / 64) as i32,
+                                    );
+                                    let world_coord = node3.origin + local_coord;
+
+                                    if let Some(mask_value) = self.sample_voxel_f32(mask_grid, world_coord) {
+                                        let (alpha, complement) = config.compute_alpha(mask_value);
+                                        ValueTy::from_f32(
+                                            complement * original_value.to_f32()
+                                                + alpha * offset_value.to_f32(),
+                                        )
+                                    } else {
+                                        offset_value
+                                    }
+                                } else {
+                                    offset_value
+                                }
+                            } else {
+                                offset_value
+                            };
+
+                            node3.buffer[idx] = final_value;
                         }
                     }
                 }
@@ -151,19 +243,25 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
 
     // Private helper methods
 
-    fn mean_pass_x(&self, grid: &Grid<ValueTy>, width: i32) -> Grid<ValueTy> {
-        self.apply_separable_filter(grid, width, 0)
+    fn mean_pass_x(&self, grid: &Grid<ValueTy>, width: i32, mask_config: &Option<MaskConfig>) -> Grid<ValueTy> {
+        self.apply_separable_filter(grid, width, 0, mask_config)
     }
 
-    fn mean_pass_y(&self, grid: &Grid<ValueTy>, width: i32) -> Grid<ValueTy> {
-        self.apply_separable_filter(grid, width, 1)
+    fn mean_pass_y(&self, grid: &Grid<ValueTy>, width: i32, mask_config: &Option<MaskConfig>) -> Grid<ValueTy> {
+        self.apply_separable_filter(grid, width, 1, mask_config)
     }
 
-    fn mean_pass_z(&self, grid: &Grid<ValueTy>, width: i32) -> Grid<ValueTy> {
-        self.apply_separable_filter(grid, width, 2)
+    fn mean_pass_z(&self, grid: &Grid<ValueTy>, width: i32, mask_config: &Option<MaskConfig>) -> Grid<ValueTy> {
+        self.apply_separable_filter(grid, width, 2, mask_config)
     }
 
-    fn apply_separable_filter(&self, grid: &Grid<ValueTy>, width: i32, axis: usize) -> Grid<ValueTy> {
+    fn apply_separable_filter(
+        &self,
+        grid: &Grid<ValueTy>,
+        width: i32,
+        axis: usize,
+        mask_config: &Option<MaskConfig>,
+    ) -> Grid<ValueTy> {
         let mut result = grid.clone();
         let kernel_size = 2 * width + 1;
         let weight = 1.0 / kernel_size as f32;
@@ -178,6 +276,7 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
                         width,
                         axis,
                         weight,
+                        mask_config,
                     );
                     node3.buffer = filtered_buffer;
                 }
@@ -194,6 +293,7 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
         width: i32,
         axis: usize,
         weight: f32,
+        mask_config: &Option<MaskConfig>,
     ) -> Vec<ValueTy> {
         let dim = 1 << Node3::<ValueTy>::LOG_2_DIM; // 2^3 = 8
         let mut filtered = node.buffer.clone();
@@ -226,7 +326,26 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
                     }
 
                     if count > 0 {
-                        filtered[idx] = ValueTy::from_f32(sum * weight);
+                        let filtered_value = sum * weight;
+
+                        // Apply mask blending if configured
+                        let final_value = if let Some(config) = mask_config {
+                            if let Some(mask_grid) = self.mask_grid {
+                                if let Some(mask_value) = self.sample_voxel_f32(mask_grid, world_coord) {
+                                    let (alpha, complement) = config.compute_alpha(mask_value);
+                                    let original_value = node.buffer[idx].to_f32();
+                                    complement * original_value + alpha * filtered_value
+                                } else {
+                                    filtered_value
+                                }
+                            } else {
+                                filtered_value
+                            }
+                        } else {
+                            filtered_value
+                        };
+
+                        filtered[idx] = ValueTy::from_f32(final_value);
                     }
                 }
             }
@@ -235,7 +354,7 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
         filtered
     }
 
-    fn median_pass(&self, grid: &Grid<ValueTy>, width: i32) -> Grid<ValueTy> {
+    fn median_pass(&self, grid: &Grid<ValueTy>, width: i32, mask_config: &Option<MaskConfig>) -> Grid<ValueTy> {
         let mut result = grid.clone();
 
         // Process each leaf node
@@ -246,6 +365,7 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
                         grid,
                         node3,
                         width,
+                        mask_config,
                     );
                     node3.buffer = filtered_buffer;
                 }
@@ -260,6 +380,7 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
         grid: &Grid<ValueTy>,
         node: &Node3<ValueTy>,
         width: i32,
+        mask_config: &Option<MaskConfig>,
     ) -> Vec<ValueTy> {
         let dim = 1 << Node3::<ValueTy>::LOG_2_DIM;
         let mut filtered = node.buffer.clone();
@@ -293,7 +414,25 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
                     if !values.is_empty() {
                         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                         let median = values[values.len() / 2];
-                        filtered[idx] = ValueTy::from_f32(median);
+
+                        // Apply mask blending if configured
+                        let final_value = if let Some(config) = mask_config {
+                            if let Some(mask_grid) = self.mask_grid {
+                                if let Some(mask_value) = self.sample_voxel_f32(mask_grid, world_coord) {
+                                    let (alpha, complement) = config.compute_alpha(mask_value);
+                                    let original_value = node.buffer[idx].to_f32();
+                                    complement * original_value + alpha * median
+                                } else {
+                                    median
+                                }
+                            } else {
+                                median
+                            }
+                        } else {
+                            median
+                        };
+
+                        filtered[idx] = ValueTy::from_f32(final_value);
                     }
                 }
             }
@@ -308,6 +447,29 @@ impl<'a, ValueTy: Filterable> Filter<'a, ValueTy> {
             for node4 in root_node.nodes.values() {
                 for node3 in node4.nodes.values() {
                     let dim = 1 << Node3::<ValueTy>::LOG_2_DIM;
+                    let local = coord - node3.origin;
+
+                    if local.x >= 0 && local.x < dim
+                        && local.y >= 0 && local.y < dim
+                        && local.z >= 0 && local.z < dim
+                    {
+                        let idx = (local.z * dim * dim + local.y * dim + local.x) as usize;
+                        if idx < node3.buffer.len() && node3.value_mask[idx] {
+                            return Some(node3.buffer[idx]);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn sample_voxel_f32(&self, grid: &Grid<f32>, coord: IVec3) -> Option<f32> {
+        // Find the leaf node containing this coordinate
+        for root_node in &grid.tree.root_nodes {
+            for node4 in root_node.nodes.values() {
+                for node3 in node4.nodes.values() {
+                    let dim = 1 << Node3::<f32>::LOG_2_DIM;
                     let local = coord - node3.origin;
 
                     if local.x >= 0 && local.x < dim
@@ -421,7 +583,7 @@ mod tests {
         let offset_value = 2.5f32;
 
         // Apply offset
-        let result = filter.offset(offset_value);
+        let result = filter.offset(offset_value, None);
 
         // Verify all values are offset correctly
         let original_node = &grid.tree.root_nodes[0].nodes[&0].nodes[&0];
@@ -452,6 +614,7 @@ mod tests {
         let config = FilterConfig {
             width: 1,
             iterations: 1,
+            mask: None,
         };
         let result = filter.mean(config);
 
@@ -482,6 +645,7 @@ mod tests {
         let config = FilterConfig {
             width: 1,
             iterations: 1,
+            mask: None,
         };
 
         // Gaussian should apply mean 4 times
@@ -491,6 +655,7 @@ mod tests {
         let mean_config = FilterConfig {
             width: 1,
             iterations: 4,
+            mask: None,
         };
         let mean_result = filter.mean(mean_config);
 
@@ -517,6 +682,7 @@ mod tests {
         let config = FilterConfig {
             width: 1,
             iterations: 1,
+            mask: None,
         };
         let result = filter.median(config);
 
@@ -547,6 +713,7 @@ mod tests {
         let config1 = FilterConfig {
             width: 1,
             iterations: 1,
+            mask: None,
         };
         let result1 = filter.mean(config1);
 
@@ -554,6 +721,7 @@ mod tests {
         let config2 = FilterConfig {
             width: 1,
             iterations: 2,
+            mask: None,
         };
         let result2 = filter.mean(config2);
 
@@ -566,6 +734,121 @@ mod tests {
             node1.buffer[center_idx], node2.buffer[center_idx],
             "Multiple iterations should produce different results"
         );
+    }
+
+    #[test]
+    fn test_mask_blending() {
+        let grid = create_test_grid();
+
+        // Create a mask grid where half the voxels have mask value 0.0 (no filter)
+        // and half have mask value 1.0 (full filter)
+        let mut mask_buffer = vec![0.0f32; 512];
+        let mut mask_value_mask = bitvec![u64, Lsb0; 0; 512];
+
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let idx = (z * 64 + y * 8 + x) as usize;
+                    // Left half: no filtering (mask = 0.0), Right half: full filtering (mask = 1.0)
+                    mask_buffer[idx] = if x < 4 { 0.0 } else { 1.0 };
+                    mask_value_mask.set(idx, true);
+                }
+            }
+        }
+
+        let mask_node3 = Node3 {
+            buffer: mask_buffer,
+            value_mask: mask_value_mask,
+            origin: IVec3::ZERO,
+        };
+
+        let mut mask_node4_map = HashMap::new();
+        mask_node4_map.insert(0, mask_node3);
+
+        let mask_node4 = Node4 {
+            child_mask: bitvec![u64, Lsb0; 1; 4096],
+            value_mask: bitvec![u64, Lsb0; 0; 4096],
+            nodes: mask_node4_map,
+            data: vec![],
+            origin: IVec3::ZERO,
+        };
+
+        let mut mask_node5_map = HashMap::new();
+        mask_node5_map.insert(0, mask_node4);
+
+        let mask_node5 = Node5 {
+            child_mask: bitvec![u64, Lsb0; 1; 32768],
+            value_mask: bitvec![u64, Lsb0; 0; 32768],
+            nodes: mask_node5_map,
+            data: vec![],
+            origin: IVec3::ZERO,
+        };
+
+        let mask_grid = Grid {
+            tree: Tree {
+                root_nodes: vec![mask_node5],
+            },
+            transform: Map::UniformScaleMap {
+                scale_values: glam::DVec3::ONE,
+                voxel_size: glam::DVec3::ONE,
+                scale_values_inverse: glam::DVec3::ONE,
+                inv_scale_sqr: glam::DVec3::ONE,
+                inv_twice_scale: glam::DVec3::splat(0.5),
+            },
+            descriptor: GridDescriptor {
+                name: "mask".to_string(),
+                file_version: 0,
+                instance_parent: String::new(),
+                grid_type: "float".to_string(),
+                grid_pos: 0,
+                block_pos: 0,
+                end_pos: 0,
+                compression: Compression::NONE,
+                meta_data: Metadata::default(),
+            },
+        };
+
+        // Apply offset with mask
+        let filter = Filter::with_mask(&grid, &mask_grid);
+        let offset_value = 10.0f32;
+        let mask_config = MaskConfig::new(0.0, 1.0);
+        let result = filter.offset(offset_value, Some(mask_config));
+
+        let original_node = &grid.tree.root_nodes[0].nodes[&0].nodes[&0];
+        let result_node = &result.tree.root_nodes[0].nodes[&0].nodes[&0];
+
+        // Verify left half (mask=0.0) is unchanged
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..4 {
+                    let idx = (z * 64 + y * 8 + x) as usize;
+                    let original_val = original_node.buffer[idx];
+                    let result_val = result_node.buffer[idx];
+                    assert!(
+                        (result_val - original_val).abs() < 0.0001,
+                        "Left half should be unchanged at ({},{},{}): original={}, result={}",
+                        x, y, z, original_val, result_val
+                    );
+                }
+            }
+        }
+
+        // Verify right half (mask=1.0) is fully offset
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 4..8 {
+                    let idx = (z * 64 + y * 8 + x) as usize;
+                    let original_val = original_node.buffer[idx];
+                    let result_val = result_node.buffer[idx];
+                    let expected = original_val + offset_value;
+                    assert!(
+                        (result_val - expected).abs() < 0.0001,
+                        "Right half should be fully offset at ({},{},{}): expected={}, result={}",
+                        x, y, z, expected, result_val
+                    );
+                }
+            }
+        }
     }
 
     #[test]
