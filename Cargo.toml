@@ -33,7 +33,9 @@ log = "0.4"
 thiserror = "1"
 
 [dev-dependencies]
-bevy = { version = "0.11", default-features = false, features = ["bevy_pbr"] }
-bevy-aabb-instancing = "0.10"
-bevy_egui = "0.22"
-smooth-bevy-cameras = "0.9"
+bevy = { version = "0.17", default-features = false, features = ["bevy_pbr"] }
+# Note: bevy-aabb-instancing doesn't support Bevy 0.17 yet (last update was for 0.12)
+# Uncomment when a Bevy 0.17-compatible version is available
+# bevy-aabb-instancing = "0.11"
+bevy_egui = "0.38"
+bevy_panorbit_camera = "0.33"
