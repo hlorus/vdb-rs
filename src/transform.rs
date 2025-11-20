@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Map {
     UniformScaleMap {
         scale_values: glam::DVec3,

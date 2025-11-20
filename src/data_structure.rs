@@ -275,7 +275,7 @@ pub struct NodeHeader<ValueTy> {
     pub log_2_dim: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node3<ValueTy> {
     pub buffer: Vec<ValueTy>,
     pub value_mask: BitVec<u64, Lsb0>,
@@ -291,7 +291,7 @@ impl<ValueTy> Node for Node3<ValueTy> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node4<ValueTy> {
     pub child_mask: BitVec<u64, Lsb0>,
     pub value_mask: BitVec<u64, Lsb0>,
@@ -309,7 +309,7 @@ impl<ValueTy> Node for Node4<ValueTy> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node5<ValueTy> {
     pub child_mask: BitVec<u64, Lsb0>,
     pub value_mask: BitVec<u64, Lsb0>,
@@ -327,7 +327,7 @@ impl<ValueTy> Node for Node5<ValueTy> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Tree<ValueTy> {
     pub root_nodes: Vec<Node5<ValueTy>>,
 }
